@@ -1,0 +1,94 @@
+---
+title: "ADA Final Project Analysis"
+author: "Yosef Chernet"
+date: "2025-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+ 
+ The following will be an analysis of the 2023 NHANES data. To assess the association between serum Vit D levels and depressive symptoms as measured by the PHQ 9 a validated measure of depressive syptoms. 
+ 
+ We will begain by importing NHANES data
+```{r Reading}
+# NHANES 2021-2023 Data Import and Merge
+# Research Question: Association between serum 25-hydroxyvitamin D and 
+# depressive symptoms (PHQ-9) among U.S. adults aged 18-45
+
+# Load required packages
+library(haven)      # For reading SAS transport files
+library(dplyr)      # For data manipulation
+library(tidyr)      # For data tidying
+
+# Import NHANES data files
+# Note: Adjust file names if needed based on actual file names
+demo <- read_xpt("DEMO_L.xpt")      # Demographics
+dpq <- read_xpt("DPQ_L.xpt")        # Depression Screener (PHQ-9)
+vid <- read_xpt("VID_L.xpt")        # Vitamin D
+alq <- read_xpt("ALQ_L.xpt")        # Alcohol Use
+smortu <- read_xpt("SMQRTU_L.xpt")  # Smoking/Tobacco Use
+ucpreg <- read_xpt("UCPREG_L.xpt")  # Pregnancy Test
+bmx <- read_xpt("BMX_L.xpt")        # BMI 
+bpq <- read_xpt("BPQ_L.xpt")        # Hypertension
+diq <- read_xpt("DIQ_L.xpt")        # Diabetes
+mcq <- read_xpt("MCQ_L.xpt")        # Chronic disease count
+
+# Display structure of key datasets
+cat("Demographics variables:\n")
+names(demo)
+
+cat("\nDepression (PHQ-9) variables:\n")
+names(dpq)
+
+cat("\nVitamin D variables:\n")
+names(vid)
+
+# Merge datasets by SEQN (unique participant identifier)
+nhanes_merged <- demo %>%
+  left_join(dpq, by = "SEQN") %>%
+  left_join(vid, by = "SEQN") %>%
+  left_join(alq, by = "SEQN") %>%
+  left_join(smortu, by = "SEQN") %>%
+  left_join(bmx, by = "SEQN") %>%
+  left_join(bpq, by = "SEQN") %>%
+  left_join(diq, by = "SEQN") %>%
+  left_join(mcq, by = "SEQN") %>%
+  left_join(ucpreg, by = "SEQN")
+
+# Check merged dataset
+cat("\nMerged dataset dimensions:\n")
+dim(nhanes_merged)
+
+cat("\nFirst few rows:\n")
+head(nhanes_merged)
+
+
+
+
+```
+
+## Filtering data
+
+
+
+```{r filetering}
+# Filter for age 18-45 adults
+# Note: RIDAGEYR is typically the age variable in NHANES
+nhanes_analysis <- nhanes_merged %>%
+  filter(RIDAGEYR >= 18 & RIDAGEYR <= 45)
+
+cat("\nFiltered dataset (ages 18-45) dimensions:\n")
+dim(nhanes_analysis)
+
+# Save the merged dataset for further analysis
+saveRDS(nhanes_analysis, "nhanes_analysis_data.rds")
+
+cat("\nData import and merge complete!")
+cat("\nNext steps: Check variable names for PHQ-9 scores and vitamin D levels")
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
