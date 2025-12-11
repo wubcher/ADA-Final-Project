@@ -1,0 +1,1014 @@
+---
+title: "ADA Final Project Analysis"
+author: "Yosef Chernet"
+date: "2025-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## INTRODUCTION
+
+The following analysis uses data from the 2021–2022 National Health and\
+Nutrition Examination Survey (NHANES) to address the question:
+
+> Among non-institutionalized U.S. adults aged 18–45 years, is serum\
+> 25-hydroxyvitamin D level associated with current depressive symptoms\
+> measured by the Patient Health Questionnaire-9 (PHQ-9)?
+
+We begin by importing the NHANES data files and preparing an analytic\
+dataset for regression modelling and multiple imputation.
+
+## LOAD PACKAGES
+
+```{r loading_packages}
+
+library(haven)      # read_xpt for SAS transport files
+library(dplyr)      # data manipulation
+library(tidyr)      # data tidying
+library(naniar)     # missingness summaries
+library(mice)       # multiple imputation
+library(survey)     # complex survey design + models
+library(car)        # VIF (if needed later)
+library(ggplot2)    # plots
+library(table1)     # descriptive Table 1
+library(flextable)  # table formatting
+```
+
+## IMPORT ALL DATA FILES
+
+```{r import_datafiles}
+cat("Importing NHANES data files...\n")
+
+# Core demographics and survey design
+demo <- read_xpt("DEMO_L.xpt")
+
+# Main exposure: Vitamin D
+vid <- read_xpt("VID_L.xpt")
+
+# Main outcome: Depression (PHQ-9)
+dpq <- read_xpt("DPQ_L.xpt")
+
+# Covariates
+bmx <- read_xpt("BMX_L.xpt")         # Body measures (BMI)
+paq <- read_xpt("PAQ_L.xpt")         # Physical activity
+diq <- read_xpt("DIQ_L.xpt")         # Diabetes
+bpq <- read_xpt("BPQ_L.xpt")         # Blood pressure/hypertension
+mcq <- read_xpt("MCQ_L.xpt")         # Medical conditions
+alq <- read_xpt("ALQ_L.xpt")         # Alcohol use
+ucpreg <- read_xpt("UCPREG_L.xpt")   # Pregnancy test (urine)
+
+cat("✓ All files imported successfully\n\n")
+
+```
+
+## MERGING DATASETS
+
+Merging Separate datasets.
+
+```{r merging}
+
+cat("Merging datasets...\n")
+
+nhanes_merged <- demo %>%
+  left_join(vid, by = "SEQN") %>%
+  left_join(dpq, by = "SEQN") %>%
+  left_join(bmx, by = "SEQN") %>%
+  left_join(paq, by = "SEQN") %>%
+  left_join(diq, by = "SEQN") %>%
+  left_join(bpq, by = "SEQN") %>%
+  left_join(mcq, by = "SEQN") %>%
+  left_join(alq, by = "SEQN") %>%
+  left_join(ucpreg, by = "SEQN")
+
+cat("✓ Datasets merged\n")
+cat(sprintf("  Total observations: %d\n\n", nrow(nhanes_merged)))
+```
+
+## SELECT VARIABLES OF INTEREST
+
+```{r Variables_of_interest}
+cat("Selecting analysis variables...\n")
+
+nhanes_analysis <- nhanes_merged %>%
+  select(
+    # IDs and survey design variables
+    SEQN,           # Respondent sequence number
+    SDMVSTRA,       # Masked variance pseudo-stratum
+    SDMVPSU,        # Masked variance pseudo-PSU
+    WTPH2YR,        # Phlebotomy subsample 2-year weight
+    
+    # Demographics
+    RIDAGEYR,       # Age
+    RIAGENDR,       # Sex
+    RIDRETH3,       # Race/ethnicity
+    DMDEDUC2,       # Education
+    INDFMPIR,       # Income-to-poverty ratio
+    RIDEXPRG,       # Pregnancy status (20-44y women)
+    RIDEXMON,       # 6-month exam period (for seasonality)
+    
+    # Main exposure: Vitamin D
+    LBXVIDMS,       # 25-hydroxyvitamin D (nmol/L)
+    
+    # Main outcome: PHQ-9 items
+    DPQ010, DPQ020, DPQ030, DPQ040, DPQ050,
+    DPQ060, DPQ070, DPQ080, DPQ090,
+    DPQ100,         # Difficulty (not part of score)
+    
+    # Body measures
+    BMXBMI,         # BMI
+    
+    # Physical activity
+    PAD800,         # Mins of moderate physical activity
+    
+    # Chronic conditions
+    DIQ010,         # Diabetes
+    BPQ020,         # Hypertension
+    BPQ150,         # Taking BP meds (optional)
+    
+    # Medical conditions for chronic disease count
+    MCQ010,         # Asthma
+    MCQ160A,        # Arthritis
+    MCQ160B,        # Congestive heart failure
+    MCQ160C,        # Coronary heart disease
+    MCQ160D,        # Angina
+    MCQ160E,        # Heart attack
+    MCQ160F,        # Stroke
+    MCQ160P,        # COPD/emphysema/chronic bronchitis
+    MCQ220,         # Cancer
+    
+    # Alcohol
+    ALQ142,         # Frequency past 12 months
+    
+    # Pregnancy test
+    URXPREG         # Urine pregnancy result
+  )
+
+cat("✓ Variables selected\n\n")
+```
+
+```{r check_weights}
+cat("Checking survey weights distribution...\n\n")
+
+# Summary of phlebotomy weights
+cat("WTPH2YR (Phlebotomy 2-year weight) summary:\n")
+summary(nhanes_analysis$WTPH2YR)
+cat("\n")
+
+# Count participants with positive weights
+n_with_weight <- sum(nhanes_analysis$WTPH2YR > 0, na.rm = TRUE)
+n_total <- nrow(nhanes_analysis)
+cat(sprintf("Participants with positive phlebotomy weight: %d / %d (%.1f%%)\n\n",
+            n_with_weight, n_total, 100 * n_with_weight / n_total))
+
+# Check for zero or missing weights
+n_zero_weight <- sum(nhanes_analysis$WTPH2YR == 0, na.rm = TRUE)
+n_missing_weight <- sum(is.na(nhanes_analysis$WTPH2YR))
+
+if (n_zero_weight > 0) {
+  cat(sprintf("WARNING: %d participants have zero phlebotomy weight\n", n_zero_weight))
+}
+if (n_missing_weight > 0) {
+  cat(sprintf("WARNING: %d participants have missing phlebotomy weight\n", n_missing_weight))
+}
+```
+
+
+
+## APPLY INCLUSION/EXCLUSION CRITERIA
+
+```{r inclusion_and_excusion}
+n_initial <- nrow(nhanes_analysis)
+cat(sprintf("  Starting N: %d\n", n_initial))
+
+# Filter: Age 18-45
+nhanes_analysis <- nhanes_analysis %>%
+  filter(RIDAGEYR >= 18 & RIDAGEYR <= 45)
+
+n_age <- nrow(nhanes_analysis)
+cat(sprintf("  After age filter (18-45): %d (excluded: %d)\n", 
+            n_age, n_initial - n_age))
+
+# Exclude pregnant participants
+nhanes_analysis <- nhanes_analysis %>%
+  filter(
+    (is.na(RIDEXPRG) | RIDEXPRG != 1) &  # Not pregnant per exam
+    (is.na(URXPREG) | URXPREG != 1)      # Not pregnant per urine test
+  )
+
+n_preg <- nrow(nhanes_analysis)
+cat(sprintf("  After pregnancy exclusion: %d (excluded: %d)\n", 
+            n_preg, n_age - n_preg))
+
+# Ensure positive phlebotomy weight (critical for vitamin D analysis)
+nhanes_analysis <- nhanes_analysis %>%
+  filter(!is.na(WTPH2YR) & WTPH2YR > 0)
+
+n_weight <- nrow(nhanes_analysis)
+cat(sprintf("  After requiring positive WTPH2YR: %d (excluded: %d)\n", 
+            n_weight, n_preg - n_weight))
+
+cat("\n✓ Inclusion/exclusion criteria applied\n\n")
+
+```
+
+## RENAME/RECODE VARIABLES
+
+```{r Recoding}
+
+cat("Renaming and recoding variables...\n")
+
+nhanes_analysis <- nhanes_analysis %>%
+  rename(
+    # Demographics
+    age                  = RIDAGEYR,
+    sex                  = RIAGENDR,
+    race_ethnicity       = RIDRETH3,
+    education            = DMDEDUC2,
+    income_poverty_ratio = INDFMPIR,
+    pregnant_exam        = RIDEXPRG,
+    exam_period          = RIDEXMON,
+    # Vitamin D
+    vitamin_d            = LBXVIDMS,
+    # PHQ-9 items
+    phq9_interest        = DPQ010,
+    phq9_depressed       = DPQ020,
+    phq9_sleep           = DPQ030,
+    phq9_tired           = DPQ040,
+    phq9_appetite        = DPQ050,
+    phq9_failure         = DPQ060,
+    phq9_concentrate     = DPQ070,
+    phq9_psychomotor     = DPQ080,
+    phq9_suicidal        = DPQ090,
+    phq9_difficulty      = DPQ100,
+    # Body measures
+    bmi                  = BMXBMI,
+    # Physical activity
+    Phymins              = PAD800,
+    # Chronic conditions
+    diabetes             = DIQ010,
+    hypertension         = BPQ020,
+    bp_meds              = BPQ150,
+    asthma               = MCQ010,
+    arthritis            = MCQ160A,
+    chf                  = MCQ160B,
+    chd                  = MCQ160C,
+    angina               = MCQ160D,
+    heart_attack         = MCQ160E,
+    stroke               = MCQ160F,
+    copd                 = MCQ160P,
+    cancer               = MCQ220,
+    # Alcohol
+    alcohol_freq         = ALQ142,
+    # Pregnancy test
+    pregnant_urine       = URXPREG
+  ) %>%
+  mutate(
+    # Sex
+    sex = factor(sex, levels = 1:2,
+                 labels = c("Male", "Female")),
+    # Race/ethnicity
+    race_ethnicity = factor(
+      race_ethnicity,
+      levels = 1:7,
+      labels = c("Mexican American", "Other Hispanic",
+                 "Non-Hispanic White", "Non-Hispanic Black",
+                 "Non-Hispanic Asian", "Other Race", "Multiracial")
+    ),
+    # Education
+    education = factor(
+      education,
+      levels = 1:5,
+      labels = c("Less than 9th grade", "9–11th grade",
+                 "High school grad/GED", "Some college/AA",
+                 "College graduate or above")
+    ),
+    
+    # Physical activity
+    phymins_cat = case_when(
+      Phymins == 0   & Phymins < 30    ~ "<30 minutes",
+      Phymins >= 30 & Phymins < 60    ~ "30–59 minutes",
+      Phymins >= 60 & Phymins <= 720  ~ "≥60 minutes",
+      Phymins %in% c(7777, 9999) |
+        is.na(Phymins)                ~ NA_character_
+    ),
+    phymins_cat = factor(
+      phymins_cat,
+      levels  = c("<30 minutes", "30–59 minutes", "≥60 minutes"),
+      ordered = TRUE
+    ),
+    
+    # Recode binary yes/no variables: 1 = Yes, 2 = No
+    across(
+      any_of(c("diabetes","hypertension","bp_meds","asthma","arthritis","chf","chd",
+               "angina","heart_attack","stroke","copd","cancer")),
+      ~ case_when(. == 1 ~ TRUE,
+                  . == 2 ~ FALSE,
+                  TRUE   ~ NA)
+    ),
+    
+    # Alcohol frequency categories
+    alcohol_cat = case_when(
+      alcohol_freq %in% 1:4              ~ "High alcohol use",
+      alcohol_freq %in% 5:7              ~ "Moderate alcohol use",
+      alcohol_freq %in% c(0, 8, 9, 10)   ~ "Low alcohol use",
+      alcohol_freq %in% c(77, 99) |
+        is.na(alcohol_freq)              ~ NA_character_
+    ),
+    alcohol_cat = factor(
+      alcohol_cat,
+      levels  = c("Low alcohol use",
+                  "Moderate alcohol use",
+                  "High alcohol use"),
+      ordered = TRUE
+    )
+  )
+
+cat("✓ Variables renamed and recoded\n\n")
+
+```
+
+## DERIVED VARIABLES
+
+```{r derived_variables}
+
+
+cat("Creating derived variables...\n")
+
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(
+    # PHQ-9 total score and binary outcome
+    phq9_total = rowSums(dplyr::select(., phq9_interest:phq9_suicidal),
+                         na.rm = FALSE),
+    depressive_symptoms = case_when(
+      phq9_total >= 10 ~ TRUE,
+      phq9_total < 10  ~ FALSE,
+      TRUE             ~ NA
+    ),
+
+    # Vitamin D in ng/mL and categories
+    vitamin_d_ngml = vitamin_d / 2.496,
+    vitamin_d_cat = factor(
+      case_when(
+        vitamin_d_ngml < 20                        ~ "Deficient",
+        vitamin_d_ngml >= 20 & vitamin_d_ngml < 30 ~ "Insufficient",
+        vitamin_d_ngml >= 30                       ~ "Sufficient",
+        TRUE                                       ~ NA_character_
+      ),
+      levels = c("Sufficient", "Insufficient", "Deficient")
+    ),
+
+    # BMI categories
+    bmi_cat = factor(
+      case_when(
+        bmi < 18.5             ~ "Underweight",
+        bmi >= 18.5 & bmi < 25 ~ "Normal",
+        bmi >= 25   & bmi < 30 ~ "Overweight",
+        bmi >= 30              ~ "Obese",
+        TRUE                   ~ NA_character_
+      ),
+      levels = c("Normal", "Overweight", "Obese", "Underweight")
+    ),
+
+    # BMI collapsed categories
+    bmi_cat3 = factor(
+      case_when(
+        bmi < 25             ~ "Normal/Underweight",
+        bmi >= 25 & bmi < 30 ~ "Overweight",
+        bmi >= 30            ~ "Obese",
+        TRUE                 ~ NA_character_
+      ),
+      levels = c("Normal/Underweight", "Overweight", "Obese")
+    ),
+
+    # Chronic disease count (from logicals)
+    chronic_disease_count = rowSums(
+      dplyr::select(., diabetes, hypertension, asthma, arthritis, chf, chd,
+                    angina, heart_attack, stroke, copd, cancer),
+      na.rm = TRUE
+    ),
+    any_chronic_disease = case_when(
+      if_all(c(diabetes, hypertension, asthma, arthritis, chf, chd,
+               angina, heart_attack, stroke, copd, cancer), is.na) ~ NA,
+      chronic_disease_count > 0  ~ TRUE,
+      chronic_disease_count == 0 ~ FALSE
+    ),
+
+    # Age categories
+    age_cat = factor(
+      case_when(
+        age >= 18 & age < 25 ~ "18–24",
+        age >= 25 & age < 35 ~ "25–34",
+        age >= 35 & age <=45 ~ "35–45",
+        TRUE                 ~ NA_character_
+      ),
+      levels = c("18–24", "25–34", "35–45")
+    )
+  )
+
+cat("✓ Derived variables created\n\n")
+
+
+```
+
+## CREATE ANALYTIC SAMPLE
+
+We restrict to participants with complete data on the exposure, outcome,\
+and survey design variables.
+
+```{r, analytic_sample}
+cat("Creating analytic sample...\n")
+
+nhanes_analytic <- nhanes_analysis %>%
+  filter(
+    !is.na(vitamin_d),
+    !is.na(phq9_total),
+    !is.na(SDMVSTRA),
+    !is.na(SDMVPSU),
+    !is.na(WTPH2YR) & WTPH2YR > 0  # Ensure complete survey design info
+  )
+
+cat(sprintf("Analytic sample size: %d\n\n", nrow(nhanes_analytic)))
+
+```
+## MISSINGNESS IN ANALYTIC SAMPLE
+
+```{r missingness, message=FALSE}
+# Variables of interest for missingness summary
+
+# Variables of interest for missingness summary
+vars_of_interest <- c(
+  # IDs / survey design
+  "SEQN", "SDMVSTRA", "SDMVPSU", "WTPH2YR",
+  
+  # Demographics
+  "age", "sex", "race_ethnicity", "education", "income_poverty_ratio",
+  
+  # Exposure & outcome
+  "vitamin_d", "vitamin_d_ngml", "vitamin_d_cat",
+  "phq9_total", "depressive_symptoms",
+  
+  # Other covariates
+  "bmi", "bmi_cat3",
+  "diabetes", "hypertension",
+  "alcohol_cat",
+  "Phymins", "phymins_cat",
+  "chronic_disease_count", "any_chronic_disease",
+  "age_cat"
+)
+
+missing_summary <- nhanes_analytic %>%
+  dplyr::select(dplyr::all_of(vars_of_interest)) %>%
+  naniar::miss_var_summary() %>%
+  arrange(desc(pct_miss))
+
+missing_summary
+
+
+
+```
+
+## BASE COMPLETE-CASE DATASET (EXCEPT EDUCATION & INCOME)
+
+For the regression models, we perform listwise deletion on all variables except education and income_poverty_ratio. These two variables will be imputed.
+
+```{r base_dataset}
+vars_no_impute <- c(
+  # Survey design (CRITICAL - must be complete)
+  "SDMVSTRA", "SDMVPSU", "WTPH2YR",
+  # Core variables
+  "depressive_symptoms", "phq9_total",
+  "vitamin_d",
+  "age", "sex", "race_ethnicity",
+  "bmi",
+  "diabetes", "hypertension",
+  "chronic_disease_count"
+)
+
+nhanes_cc_base <- nhanes_analytic %>%
+  filter(complete.cases(dplyr::select(., dplyr::all_of(vars_no_impute))))
+
+cat(sprintf(
+  "Base complete-case N (before imputing education, income_poverty_ratio, Phymins, alcohol_freq): %d\n\n",
+  nrow(nhanes_cc_base)
+))
+
+# Verify survey design completeness
+cat("Survey design variables in base dataset:\n")
+cat(sprintf("  All SDMVSTRA complete: %s\n", all(!is.na(nhanes_cc_base$SDMVSTRA))))
+cat(sprintf("  All SDMVPSU complete: %s\n", all(!is.na(nhanes_cc_base$SDMVPSU))))
+cat(sprintf("  All WTPH2YR positive: %s\n\n", all(nhanes_cc_base$WTPH2YR > 0)))
+
+# Check remaining missingness in the variables that will be imputed
+nhanes_cc_base %>%
+  dplyr::select(education, income_poverty_ratio, Phymins, alcohol_freq) %>%
+  naniar::miss_var_summary()
+```
+
+
+## MISSING DATA PATTERN FOR IMPUTATION
+
+```{r missingness_pattern}
+impute_df <- nhanes_cc_base %>%
+  dplyr::select(
+    # IDs / design & weights (keep but won't impute)
+    SEQN, SDMVSTRA, SDMVPSU, WTPH2YR,
+    
+    # Variables to be imputed
+    education,
+    income_poverty_ratio,
+    Phymins,
+    alcohol_freq,
+    
+    # Predictors for imputation
+    age, sex, race_ethnicity,
+    bmi,
+    diabetes, hypertension,
+    chronic_disease_count, any_chronic_disease,
+    depressive_symptoms,
+    vitamin_d
+  )
+
+md.pattern(impute_df, rotate.names = TRUE)
+```
+
+## MULTIPLE IMPUTATION (EDUCATION & INCOME-TO-POVERTY RATIO)
+
+```{r multiple_imputation}
+# Initial run to obtain default methods and predictor matrix
+init <- mice(impute_df, maxit = 0)
+meth <- init$method
+pred <- init$predictorMatrix
+
+# Turn off imputation for all variables
+meth[] <- ""
+
+# Turn on imputation only for education (factor) and income_poverty_ratio (numeric)
+meth["education"]            <- "polyreg"  # multinomial logistic
+meth["income_poverty_ratio"] <- "pmm"      # predictive mean matching
+meth["Phymins"]              <- "pmm"      # predictive mean matching
+meth["alcohol_freq"]         <- "pmm"      # predictive mean matching
+
+# Do not use design variables as predictors
+pred[, c("SEQN", "SDMVSTRA", "SDMVPSU", "WTPH2YR")] <- 0
+
+# Run imputation
+set.seed(600)
+imp <- mice(
+  impute_df,
+  m               = 10,
+  maxit           = 20,
+  method          = meth,
+  predictorMatrix = pred,
+  printFlag       = FALSE
+)
+
+cat("✓ Multiple imputation completed\n")
+print(imp)
+```
+
+
+## COMPARE ORIGINAL VS IMPUTED DATA
+
+## INSPECT IMPUTED VALUES
+
+```{r inspect_impute}
+# Check which variables were actually imputed
+cat("Variables that were imputed:\n")
+print(names(imp$imp))
+cat("\n")
+
+# Imputed values for income_poverty_ratio (if it exists)
+if ("income_poverty_ratio" %in% names(imp$imp)) {
+  cat("First 10 imputed values for income_poverty_ratio:\n")
+  print(head(imp$imp$income_poverty_ratio, 10))
+  cat("\n")
+}
+
+# Imputed values for education (if it exists)
+if ("education" %in% names(imp$imp)) {
+  cat("First 10 imputed values for education:\n")
+  print(head(imp$imp$education, 10))
+  cat("\n")
+}
+
+# Imputed values for Phymins (if it exists)
+if ("Phymins" %in% names(imp$imp)) {
+  cat("First 10 imputed values for Phymins:\n")
+  print(head(imp$imp$Phymins, 10))
+  cat("\n")
+}
+
+# Imputed values for alcohol_freq (if it exists)
+if ("alcohol_freq" %in% names(imp$imp)) {
+  cat("First 10 imputed values for alcohol_freq:\n")
+  print(head(imp$imp$alcohol_freq, 10))
+  cat("\n")
+}
+
+# Basic imputation summary
+cat("\n=== IMPUTATION SUMMARY ===\n")
+print(imp)
+
+# Convergence plot (optional - shows if imputation converged)
+plot(imp)
+```
+
+
+
+
+## DERIVED VARIABLES AFTER IMPUTATION
+
+```{r derive_after_imputation}
+# Get all imputations in long format (including original as .imp = 0 if you want)
+completed_long <- complete(imp, action = "long", include = TRUE)
+
+# Recreate derived variables that depend on imputed fields
+completed_long <- completed_long %>%
+  mutate(
+    # Income-to-poverty ratio categories (now using imputed income_poverty_ratio)
+    poverty_cat = factor(
+      case_when(
+        income_poverty_ratio < 1.3                             ~ "<1.3 (Low)",
+        income_poverty_ratio >= 1.3 & income_poverty_ratio < 3 ~ "1.3–<3.0 (Middle)",
+        income_poverty_ratio >= 3.0                            ~ "≥3.0 (High)",
+        TRUE                                                    ~ NA_character_
+      ),
+      levels = c("≥3.0 (High)", "1.3–<3.0 (Middle)", "<1.3 (Low)")
+    ),
+
+    # Physical activity categories from imputed Phymins
+    phymins_cat = case_when(
+      Phymins > 0   & Phymins < 30    ~ "<30 minutes",
+      Phymins >= 30 & Phymins < 60    ~ "30–59 minutes",
+      Phymins >= 60 & Phymins <= 720  ~ "≥60 minutes",
+      Phymins %in% c(7777, 9999) |
+        is.na(Phymins)                ~ NA_character_
+    ),
+    phymins_cat = factor(
+      phymins_cat,
+      levels  = c("<30 minutes", "30–59 minutes", "≥60 minutes"),
+      ordered = TRUE
+    ),
+
+    # Alcohol categories from imputed alcohol_freq
+    alcohol_cat = case_when(
+      alcohol_freq %in% 1:4            ~ "High alcohol use",
+      alcohol_freq %in% 5:7            ~ "Moderate alcohol use",
+      alcohol_freq %in% c(0, 8, 9, 10) ~ "Low alcohol use",
+      alcohol_freq %in% c(77, 99) |
+        is.na(alcohol_freq)            ~ NA_character_
+    ),
+    alcohol_cat = factor(
+      alcohol_cat,
+      levels  = c("Low alcohol use",
+                  "Moderate alcohol use",
+                  "High alcohol use"),
+      ordered = TRUE
+    )
+  )
+
+# Quick check
+completed_long %>%
+  group_by(.imp) %>%
+  summarise(
+    n = n(),
+    miss_poverty   = sum(is.na(poverty_cat)),
+    miss_phymins   = sum(is.na(phymins_cat)),
+    miss_alcohol   = sum(is.na(alcohol_cat))
+  )
+```
+
+## TABLE 1: DESCRIPTIVE CHARACTERISTICS 
+
+For descriptive purposes, we create Table 1 of participant
+
+
+```{r table1_with_vitd, message=FALSE}
+# Use first completed dataset from the imputation and (re)create derived vars
+imp1 <- complete(imp, action = 1) %>%
+  mutate(
+    # Vitamin D in ng/mL and categories
+    vitamin_d_ngml = vitamin_d / 2.496,
+    vitamin_d_cat = factor(
+      case_when(
+        vitamin_d_ngml < 20                        ~ "Deficient",
+        vitamin_d_ngml >= 20 & vitamin_d_ngml < 30 ~ "Insufficient",
+        vitamin_d_ngml >= 30                       ~ "Sufficient",
+        TRUE                                       ~ NA_character_
+      ),
+      levels = c("Sufficient", "Insufficient", "Deficient")
+    ),
+    
+    # Physical activity categories from imputed Phymins
+    phymins_cat = case_when(
+      Phymins > 0   & Phymins < 30    ~ "<30 minutes",
+      Phymins >= 30 & Phymins < 60    ~ "30–59 minutes",
+      Phymins >= 60 & Phymins <= 720  ~ "≥60 minutes",
+      Phymins %in% c(7777, 9999) |
+        is.na(Phymins)                ~ NA_character_
+    ),
+    phymins_cat = factor(
+      phymins_cat,
+      levels  = c("<30 minutes", "30–59 minutes", "≥60 minutes"),
+      ordered = TRUE
+    ),
+    
+    # Alcohol categories from imputed alcohol_freq
+    alcohol_cat = case_when(
+      alcohol_freq %in% 1:4            ~ "High alcohol use",
+      alcohol_freq %in% 5:7            ~ "Moderate alcohol use",
+      alcohol_freq %in% c(0, 8, 9, 10) ~ "Low alcohol use",
+      alcohol_freq %in% c(77, 99) |
+        is.na(alcohol_freq)            ~ NA_character_
+    ),
+    alcohol_cat = factor(
+      alcohol_cat,
+      levels  = c("Low alcohol use",
+                  "Moderate alcohol use",
+                  "High alcohol use"),
+      ordered = TRUE
+    )
+  )
+
+# Add labels for nicer Table 1 output
+label(imp1$vitamin_d_cat)        <- "Vitamin D category"
+label(imp1$age)                  <- "Age (years)"
+label(imp1$sex)                  <- "Sex"
+label(imp1$race_ethnicity)       <- "Race/ethnicity"
+label(imp1$education)            <- "Education"
+label(imp1$income_poverty_ratio) <- "Income-to-poverty ratio"
+label(imp1$bmi)                  <- "Body mass index (kg/m²)"
+label(imp1$phymins_cat)          <- "Leisure-time PA (minutes/bout)"
+label(imp1$alcohol_cat)          <- "Alcohol use (past year)"
+label(imp1$any_chronic_disease)  <- "Any chronic disease"
+label(imp1$depressive_symptoms)  <- "Depressive symptoms (PHQ-9 ≥10)"
+
+# ---- Table 1 stratified BY vitamin D category ----
+tab1 <- table1(
+  ~ sex +
+    age +
+    race_ethnicity +
+    education +
+    income_poverty_ratio +
+    bmi +
+    phymins_cat +
+    alcohol_cat +
+    any_chronic_disease +
+    depressive_symptoms
+  | vitamin_d_cat,
+  data = imp1
+)
+
+tab1  # prints nicely in HTML
+
+# ---- Export Table 1 to PowerPoint ----
+ft_tab1 <- t1flex(tab1)
+
+save_as_pptx(
+  "Table 1. Participant characteristics by vitamin D category" = ft_tab1,
+  path = "Table1_characteristics_by_vitD.pptx"
+)
+
+
+```
+
+
+```{r}
+# Export Table 1 to Word (.docx)
+library(flextable)  # already loaded above, but safe to call
+
+save_as_docx(
+  "Table 1. Participant characteristics by vitamin D category" = ft_tab1,
+  path = "Table1_characteristics_by_vitD.docx"
+)
+```
+
+```{r}
+imp1 <- complete(imp, action = 1)
+
+cat_vars <- c(
+  "vitamin_d_cat",
+  "sex",
+  "race_ethnicity",
+  "education",
+  "smoking_status",
+  "alcohol_cat",
+  "any_chronic_disease"
+)
+
+for (v in cat_vars) {
+  cat("\n\n=====================================\n")
+  cat("Cross-tab of", v, "by depressive_symptoms\n")
+  cat("=====================================\n")
+  
+  f <- as.formula(paste("~", v, "+ depressive_symptoms"))
+  
+  tab <- xtabs(f, data = imp1)
+  print(tab)
+  
+  cat("\nColumn percentages within depressive_symptoms (%):\n")
+  print(round(prop.table(tab, margin = 2) * 100, 1))
+}
+
+
+```
+## UNWEIGHTED LOGISTIC REGRESSION WITH IMPUTATION
+
+## ============================
+## PRIMARY OBJECTIVE LOGISTIC REGRESSION
+## ============================
+
+```{r build_imp1_analysis}
+
+# 1) Take first completed dataset from the imputation
+imp1 <- complete(imp, action = 1) %>%
+  mutate(
+    # Binary outcome
+    dep_bin = if_else(depressive_symptoms, 1L, 0L),
+
+    # Vitamin D in ng/mL and categories
+    vitamin_d_ngml = vitamin_d / 2.496,
+    vitamin_d_cat = factor(
+      case_when(
+        vitamin_d_ngml < 20                        ~ "Deficient",
+        vitamin_d_ngml >= 20 & vitamin_d_ngml < 30 ~ "Insufficient",
+        vitamin_d_ngml >= 30                       ~ "Sufficient",
+        TRUE                                       ~ NA_character_
+      ),
+      levels = c("Sufficient", "Insufficient", "Deficient")
+    ),
+
+    # Poverty categories from imputed income_poverty_ratio
+    poverty_cat = factor(
+      case_when(
+        income_poverty_ratio < 1.3                             ~ "<1.3 (Low)",
+        income_poverty_ratio >= 1.3 & income_poverty_ratio < 3 ~ "1.3–<3.0 (Middle)",
+        income_poverty_ratio >= 3.0                            ~ "≥3.0 (High)",
+        TRUE                                                    ~ NA_character_
+      ),
+      levels = c("≥3.0 (High)", "1.3–<3.0 (Middle)", "<1.3 (Low)")
+    ),
+
+    # Physical activity categories from imputed Phymins
+    phymins_cat = case_when(
+      Phymins > 0   & Phymins < 30    ~ "<30 minutes",
+      Phymins >= 30 & Phymins < 60    ~ "30–59 minutes",
+      Phymins >= 60 & Phymins <= 720  ~ "≥60 minutes",
+      Phymins %in% c(7777, 9999) |
+        is.na(Phymins)                ~ NA_character_
+    ),
+    phymins_cat = factor(
+      phymins_cat,
+      levels  = c("<30 minutes", "30–59 minutes", "≥60 minutes"),
+      ordered = TRUE
+    ),
+
+    # Alcohol categories from imputed alcohol_freq
+    alcohol_cat = case_when(
+      alcohol_freq %in% 1:4            ~ "High alcohol use",
+      alcohol_freq %in% 5:7            ~ "Moderate alcohol use",
+      alcohol_freq %in% c(0, 8, 9, 10) ~ "Low alcohol use",
+      alcohol_freq %in% c(77, 99) |
+        is.na(alcohol_freq)            ~ NA_character_
+    ),
+    alcohol_cat = factor(
+      alcohol_cat,
+      levels  = c("Low alcohol use",
+                  "Moderate alcohol use",
+                  "High alcohol use"),
+      ordered = TRUE
+    )
+  )
+
+
+
+```
+## 2. Primary model: vitamin D and depressive symptoms
+
+Adjusted to:
+
+- Use **imputed** data (`imp1`) instead of pre-imputation `nhanes_analysis`.
+- Drop `smoking_status` (no longer in your data).
+- Add physical activity (`phymins_cat`) as a lifestyle covariate.
+- Keep `chronic_disease_count` as a marker of comorbidity.
+
+
+```{r primary_logit_vitD}
+
+## ============================
+## PRIMARY OBJECTIVE LOGISTIC REGRESSION
+## ============================
+
+# 1. Build analysis dataset from imputed data
+nhanes_simple <- imp1 %>%
+  mutate(
+    vitamin_d_cat = relevel(vitamin_d_cat, ref = "Sufficient")
+  ) %>%
+  select(
+    dep_bin,
+    vitamin_d_cat,
+    age,
+    sex,
+    race_ethnicity,
+    education,
+    income_poverty_ratio,
+    bmi,
+    phymins_cat,
+    alcohol_cat,
+    chronic_disease_count
+  ) %>%
+  drop_na()   # remove any residual NAs (e.g. rare missing categories)
+
+nrow(nhanes_simple)  # sample size used in model
+
+# 2. Fit logistic regression (still unweighted, for simplicity)
+fit_logit <- glm(
+  dep_bin ~ vitamin_d_cat +
+    age + sex + race_ethnicity +
+    education + income_poverty_ratio +
+    bmi +
+    phymins_cat + alcohol_cat +
+    chronic_disease_count,
+  data   = nhanes_simple,
+  family = binomial()
+)
+
+summary(fit_logit)
+
+# 3. Odds ratios and 95% CIs
+or_table <- cbind(
+  OR  = exp(coef(fit_logit)),
+  exp(confint.default(fit_logit))
+)
+
+colnames(or_table) <- c("OR", "LCL", "UCL")
+or_table
+
+
+```
+
+
+
+## 3. Secondary model: poverty and depressive symptoms
+
+Adjusted to:
+
+- Use **imputed poverty_cat** created above.
+- Use `imp1` (imputed data).
+- Drop `smoking_status`.
+- Include `phymins_cat` and `alcohol_cat` as lifestyle covariates.
+- Do not include `income_poverty_ratio` in the poverty model (would be collinear with `poverty_cat`).
+
+```{r secondary_logit_poverty}
+## ============================
+## SECONDARY MODEL: POVERTY
+## ============================
+
+# 1. Build analysis dataset
+nhanes_pov <- imp1 %>%
+  mutate(
+    dep_bin = if_else(depressive_symptoms, 1L, 0L),
+    poverty_cat = relevel(poverty_cat, ref = "≥3.0 (High)")
+  ) %>%
+  select(
+    dep_bin,
+    poverty_cat,
+    age,
+    sex,
+    race_ethnicity,
+    education,
+    bmi,
+    phymins_cat,
+    alcohol_cat,
+    chronic_disease_count
+  ) %>%
+  drop_na()
+
+nrow(nhanes_pov)  # sample size for poverty model
+
+# 2. Fit logistic regression with poverty category
+fit_pov <- glm(
+  dep_bin ~ poverty_cat +
+    age + sex + race_ethnicity +
+    education +
+    bmi +
+    phymins_cat + alcohol_cat +
+    chronic_disease_count,
+  data   = nhanes_pov,
+  family = binomial()
+)
+
+summary(fit_pov)
+
+# 3. Odds ratios and 95% CIs
+or_pov <- cbind(
+  OR  = exp(coef(fit_pov)),
+  exp(confint.default(fit_pov))
+)
+
+colnames(or_pov) <- c("OR", "LCL", "UCL")
+or_pov
+```
